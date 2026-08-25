@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#111827">
-<title>Hörbuch Komfort-Player</title>
+<title>Hörbuch Komfort-Player V2</title>
 <style>
 :root{
   --bg:#0b1020; --panel:#151b2e; --panel2:#1d263d; --text:#f4f7fb;
@@ -28,6 +28,7 @@ select,button{
 }
 select{width:100%;padding:12px}
 .status{font-size:12px;color:var(--muted);margin-top:9px}
+.recovery{font-size:11px;color:var(--muted);text-align:center;margin-top:6px;min-height:16px}
 .chapter-list{display:grid;gap:8px}
 .chapter{
   width:100%;display:grid;grid-template-columns:38px 1fr auto;gap:10px;align-items:center;
@@ -63,7 +64,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 </head>
 <body>
 <header>
-  <h1>Hörbuch Komfort-Player</h1>
+  <h1>Hörbuch Komfort-Player V2</h1>
   <div class="sub">Position wird automatisch auf diesem Gerät gespeichert. Die Audio-Dateien bleiben auf den ursprünglichen externen Servern.</div>
 </header>
 
@@ -101,7 +102,8 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       <button id="restart">Kapitel neu</button>
       <button id="forget">Position löschen</button>
     </div>
-    <div class="note">Tipp: Auf Android funktionieren die Play/Pause- und Sprungtasten meist auch über Sperrbildschirm/Benachrichtigung.</div>
+    <div id="recoveryStatus" class="recovery"></div>
+<div class="note">Tipp: Auf Android funktionieren die Play/Pause- und Sprungtasten meist auch über Sperrbildschirm/Benachrichtigung.</div>
   </div>
 </div>
 
@@ -126,6 +128,14 @@ let bookId = Number(localStorage.getItem("hp_last_book") || 2);
 let trackIndex = Number(localStorage.getItem("hp_last_track") || 0);
 let restoring = false;
 let lastSave = 0;
+let recoveryInProgress = false;
+let recoveryAttempts = 0;
+let recoveryTimer = null;
+let lastKnownGoodTime = 0;
+let lastProgressTimestamp = Date.now();
+let lastProgressTime = 0;
+let userPaused = false;
+let shouldBePlaying = false;
 
 for (const [id,title] of BOOKS) {
   const o=document.createElement("option"); o.value=id; o.textContent=`${id}. ${title}`;
@@ -194,6 +204,12 @@ function escapeHtml(s){
 }
 function loadTrack(i, autoplay=false, restore=true){
   if(!tracks[i])return;
+  clearTimeout(recoveryTimer);
+  recoveryInProgress=false;
+  recoveryAttempts=0;
+  userPaused=!autoplay;
+  shouldBePlaying=autoplay;
+  setRecoveryStatus("");
   savePosition();
   trackIndex=i;
   localStorage.setItem("hp_last_track",trackIndex);
@@ -208,7 +224,62 @@ function loadTrack(i, autoplay=false, restore=true){
 }
 function savePosition(){
   if(!audio.src || !isFinite(audio.currentTime))return;
-  localStorage.setItem(keyPos(), String(audio.currentTime));
+  const t = Math.max(0, Number(audio.currentTime) || 0);
+  localStorage.setItem(keyPos(), String(t));
+  if(t > 0) lastKnownGoodTime = t;
+}
+function setRecoveryStatus(msg=""){
+  $("recoveryStatus").textContent = msg;
+}
+function getResumePosition(){
+  const stored = Number(localStorage.getItem(keyPos()) || 0);
+  const current = isFinite(audio.currentTime) ? Number(audio.currentTime) : 0;
+  return Math.max(stored, lastKnownGoodTime, current);
+}
+function recoverPlayback(reason="Unterbrechung"){
+  if(recoveryInProgress || !tracks[trackIndex] || userPaused || !shouldBePlaying) return;
+
+  recoveryInProgress = true;
+  recoveryAttempts++;
+  const resumeAt = getResumePosition();
+  const delay = Math.min(800 * recoveryAttempts, 4000);
+  setRecoveryStatus(`${reason} – verbinde neu …`);
+
+  clearTimeout(recoveryTimer);
+  recoveryTimer = setTimeout(() => {
+    const originalUrl = tracks[trackIndex].url;
+    const retryUrl = originalUrl + (originalUrl.includes("?") ? "&" : "?") + "_retry=" + Date.now();
+
+    try { audio.pause(); } catch(e) {}
+    audio.removeAttribute("src");
+    audio.load();
+    audio.src = retryUrl;
+    audio.load();
+
+    const resume = async () => {
+      try {
+        if(resumeAt > 0){
+          if(isFinite(audio.duration) && audio.duration > 0){
+            audio.currentTime = Math.min(resumeAt, Math.max(0, audio.duration - 0.25));
+          } else {
+            audio.currentTime = resumeAt;
+          }
+        }
+        await audio.play();
+        recoveryInProgress = false;
+        recoveryAttempts = 0;
+        lastProgressTimestamp = Date.now();
+        setRecoveryStatus(`Weiter ab ${fmt(resumeAt)}`);
+        setTimeout(()=>{ if(!recoveryInProgress) setRecoveryStatus(""); }, 2500);
+      } catch(e) {
+        recoveryInProgress = false;
+        setRecoveryStatus("Neuer Verbindungsversuch …");
+        setTimeout(()=>recoverPlayback("Verbindung unterbrochen"), 1000);
+      }
+    };
+
+    audio.addEventListener("canplay", resume, {once:true});
+  }, delay);
 }
 function updateUI(){
   $("play").textContent=audio.paused?"▶":"⏸";
@@ -235,10 +306,56 @@ audio.addEventListener("loadedmetadata",()=>{
 audio.addEventListener("timeupdate",()=>{
   updateUI();
   const now=Date.now();
-  if(now-lastSave>2000){savePosition();lastSave=now;}
+
+  if(Math.abs(audio.currentTime-lastProgressTime) > 0.2){
+    lastProgressTime=audio.currentTime;
+    lastKnownGoodTime=audio.currentTime;
+    lastProgressTimestamp=now;
+  }
+
+  if(now-lastSave>1000){savePosition();lastSave=now;}
 });
-audio.addEventListener("play",updateUI);
-audio.addEventListener("pause",()=>{savePosition();updateUI();renderChapters();});
+audio.addEventListener("play",()=>{
+  shouldBePlaying=true;
+  userPaused=false;
+  lastProgressTimestamp=Date.now();
+  updateUI();
+});
+audio.addEventListener("pause",()=>{
+  savePosition();
+  updateUI();
+  renderChapters();
+  if(!userPaused && shouldBePlaying && !audio.ended && !recoveryInProgress){
+    setTimeout(()=>{
+      if(audio.paused && !userPaused && shouldBePlaying && !audio.ended){
+        recoverPlayback("Wiedergabe gestoppt");
+      }
+    },1200);
+  }
+});
+audio.addEventListener("stalled",()=>{
+  if(shouldBePlaying && !userPaused) recoverPlayback("Stream hängt");
+});
+audio.addEventListener("error",()=>{
+  if(shouldBePlaying && !userPaused){
+    recoveryInProgress=false;
+    recoverPlayback("Streamfehler");
+  }
+});
+audio.addEventListener("waiting",()=>{
+  if(shouldBePlaying && !userPaused) setRecoveryStatus("Pufferung …");
+});
+audio.addEventListener("playing",()=>{
+  if(!recoveryInProgress) setRecoveryStatus("");
+});
+
+setInterval(()=>{
+  if(audio.paused || audio.ended || recoveryInProgress || userPaused || !shouldBePlaying || !audio.src) return;
+  if(Date.now()-lastProgressTimestamp > 8000){
+    recoverPlayback("Keine Audiodaten");
+  }
+},3000);
+
 audio.addEventListener("ended",()=>{
   localStorage.setItem(keyDone(trackIndex),"1");
   localStorage.setItem(keyPos(),"0");
@@ -246,7 +363,24 @@ audio.addEventListener("ended",()=>{
   else { updateUI(); renderChapters(); }
 });
 
-$("play").onclick=()=> audio.src ? (audio.paused?audio.play():audio.pause()) : loadTrack(trackIndex,true,true);
+$("play").onclick=()=>{
+  if(!audio.src){
+    userPaused=false;
+    shouldBePlaying=true;
+    loadTrack(trackIndex,true,true);
+    return;
+  }
+  if(audio.paused){
+    userPaused=false;
+    shouldBePlaying=true;
+    audio.play();
+  }else{
+    userPaused=true;
+    shouldBePlaying=false;
+    savePosition();
+    audio.pause();
+  }
+};
 $("back").onclick=()=>audio.currentTime=Math.max(0,audio.currentTime-15);
 $("forward").onclick=()=>audio.currentTime=Math.min(audio.duration||Infinity,audio.currentTime+15);
 $("prev").onclick=()=>{ if(trackIndex>0)loadTrack(trackIndex-1,true,true); };
