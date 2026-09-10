@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#111827">
-<title>Hörbuch Komfort-Player V2</title>
+<title>Hörbuch Komfort-Player V3</title>
 <style>
 :root{
   --bg:#0b1020; --panel:#151b2e; --panel2:#1d263d; --text:#f4f7fb;
@@ -64,7 +64,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 </head>
 <body>
 <header>
-  <h1>Hörbuch Komfort-Player V2</h1>
+  <h1>Hörbuch Komfort-Player V3</h1>
   <div class="sub">Position wird automatisch auf diesem Gerät gespeichert. Die Audio-Dateien bleiben auf den ursprünglichen externen Servern.</div>
 </header>
 
@@ -195,7 +195,7 @@ function renderChapters(){
     const done=localStorage.getItem(keyDone(i))==="1";
     b.className="chapter"+(i===trackIndex?" active":"")+(done?" done":"");
     b.innerHTML=`<span class="num">${i+1}</span><span><span class="chapter-title">${escapeHtml(t.name)}</span></span><span class="saved">${done?"✓ gehört":saved>5?"ab "+fmt(saved):""}</span>`;
-    b.onclick=()=>loadTrack(i,true,false);
+    b.onclick=()=>loadTrack(i,true,true);
     root.appendChild(b);
   });
 }
@@ -231,6 +231,31 @@ function savePosition(){
 function setRecoveryStatus(msg=""){
   $("recoveryStatus").textContent = msg;
 }
+async function seekReliably(target, maxAttempts=12){
+  target = Number(target) || 0;
+  if(target <= 0) return true;
+  for(let attempt=1; attempt<=maxAttempts; attempt++){
+    try{
+      if(isFinite(audio.duration) && audio.duration>0){
+        target = Math.min(target, Math.max(0, audio.duration-0.5));
+      }
+      audio.currentTime = target;
+      await new Promise(r=>setTimeout(r, 180));
+      if(Math.abs((audio.currentTime||0)-target) < 1.5){
+        return true;
+      }
+      // Some remote MP3 sources accept seeks only after a seekable range exists.
+      if(audio.seekable && audio.seekable.length){
+        const start=audio.seekable.start(0), end=audio.seekable.end(audio.seekable.length-1);
+        if(target>=start && target<=end){
+          audio.currentTime=target;
+        }
+      }
+    }catch(e){}
+    await new Promise(r=>setTimeout(r, 250));
+  }
+  return false;
+}
 function getResumePosition(){
   const stored = Number(localStorage.getItem(keyPos()) || 0);
   const current = isFinite(audio.currentTime) ? Number(audio.currentTime) : 0;
@@ -259,11 +284,7 @@ function recoverPlayback(reason="Unterbrechung"){
     const resume = async () => {
       try {
         if(resumeAt > 0){
-          if(isFinite(audio.duration) && audio.duration > 0){
-            audio.currentTime = Math.min(resumeAt, Math.max(0, audio.duration - 0.25));
-          } else {
-            audio.currentTime = resumeAt;
-          }
+          await seekReliably(resumeAt);
         }
         await audio.play();
         recoveryInProgress = false;
@@ -295,10 +316,15 @@ function updateMediaSession(){
   });
 }
 
-audio.addEventListener("loadedmetadata",()=>{
+audio.addEventListener("loadedmetadata",async()=>{
   if(restoring){
     const p=Number(localStorage.getItem(keyPos())||0);
-    if(p>0 && p<audio.duration-3) audio.currentTime=p;
+    if(p>0){
+      setRecoveryStatus(`Springe zu ${fmt(p)} …`);
+      const ok=await seekReliably(p);
+      setRecoveryStatus(ok ? `Fortgesetzt bei ${fmt(p)}` : `Position ${fmt(p)} konnte nicht gesetzt werden`);
+      setTimeout(()=>{if(!recoveryInProgress)setRecoveryStatus("");},2200);
+    }
     restoring=false;
   }
   updateUI();
@@ -381,11 +407,18 @@ $("play").onclick=()=>{
     audio.pause();
   }
 };
-$("back").onclick=()=>audio.currentTime=Math.max(0,audio.currentTime-15);
-$("forward").onclick=()=>audio.currentTime=Math.min(audio.duration||Infinity,audio.currentTime+15);
+$("back").onclick=async()=>{const t=Math.max(0,audio.currentTime-15);await seekReliably(t);savePosition();};
+$("forward").onclick=async()=>{const t=Math.min(audio.duration||Infinity,audio.currentTime+15);await seekReliably(t);savePosition();};
 $("prev").onclick=()=>{ if(trackIndex>0)loadTrack(trackIndex-1,true,true); };
 $("next").onclick=()=>{ if(trackIndex<tracks.length-1)loadTrack(trackIndex+1,true,true); };
-$("seek").oninput=e=>{ if(audio.duration) audio.currentTime=(Number(e.target.value)/1000)*audio.duration; };
+$("seek").onchange=async e=>{
+  if(!audio.duration)return;
+  const target=(Number(e.target.value)/1000)*audio.duration;
+  setRecoveryStatus(`Springe zu ${fmt(target)} …`);
+  await seekReliably(target);
+  savePosition();
+  setRecoveryStatus("");
+};
 $("restart").onclick=()=>{audio.currentTime=0;savePosition();};
 $("forget").onclick=()=>{
   localStorage.removeItem(keyPos());
