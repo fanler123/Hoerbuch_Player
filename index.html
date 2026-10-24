@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#111827">
-<title>Hörbuch Komfort-Player V3</title>
+<title>Hörbuch Komfort-Player V4</title>
 <style>
 :root{
   --bg:#0b1020; --panel:#151b2e; --panel2:#1d263d; --text:#f4f7fb;
@@ -14,7 +14,7 @@
 body{
   margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
   background:linear-gradient(180deg,#0b1020,#10172a); color:var(--text);
-  min-height:100vh; padding-bottom:190px;
+  min-height:100vh; padding-bottom:var(--player-space, 270px);
 }
 header{padding:18px 16px 8px;max-width:900px;margin:auto}
 h1{font-size:22px;margin:0 0 6px}
@@ -58,13 +58,13 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 .hidden{display:none}
 @media (min-width:700px){
   .chapter-list{grid-template-columns:1fr 1fr}
-  body{padding-bottom:175px}
+  body{padding-bottom:var(--player-space, 270px)}
 }
 </style>
 </head>
 <body>
 <header>
-  <h1>Hörbuch Komfort-Player V3</h1>
+  <h1>Hörbuch Komfort-Player V4</h1>
   <div class="sub">Position wird automatisch auf diesem Gerät gespeichert. Die Audio-Dateien bleiben auf den ursprünglichen externen Servern.</div>
 </header>
 
@@ -215,6 +215,8 @@ function loadTrack(i, autoplay=false, restore=true){
   localStorage.setItem("hp_last_track",trackIndex);
   const t=tracks[i];
   restoring=restore;
+  lastKnownGoodTime=0;
+  lastProgressTime=0;
   audio.src=t.url;
   $("nowTitle").textContent=t.name;
   $("nowBook").textContent=BOOKS.find(b=>b[0]===bookId)[1];
@@ -231,30 +233,33 @@ function savePosition(){
 function setRecoveryStatus(msg=""){
   $("recoveryStatus").textContent = msg;
 }
-async function seekReliably(target, maxAttempts=12){
-  target = Number(target) || 0;
-  if(target <= 0) return true;
-  for(let attempt=1; attempt<=maxAttempts; attempt++){
-    try{
-      if(isFinite(audio.duration) && audio.duration>0){
-        target = Math.min(target, Math.max(0, audio.duration-0.5));
-      }
-      audio.currentTime = target;
-      await new Promise(r=>setTimeout(r, 180));
-      if(Math.abs((audio.currentTime||0)-target) < 1.5){
-        return true;
-      }
-      // Some remote MP3 sources accept seeks only after a seekable range exists.
-      if(audio.seekable && audio.seekable.length){
-        const start=audio.seekable.start(0), end=audio.seekable.end(audio.seekable.length-1);
-        if(target>=start && target<=end){
-          audio.currentTime=target;
-        }
-      }
-    }catch(e){}
-    await new Promise(r=>setTimeout(r, 250));
-  }
-  return false;
+let seekGeneration=0;
+let seekTimer=null;
+function seekTo(target){
+  // Neueste Eingabe gewinnt: wiederholte 15-Sekunden-Tipps blockieren nicht.
+  clearTimeout(seekTimer);
+  seekGeneration++;
+  if(!audio.src || !Number.isFinite(target))return;
+  const duration=Number.isFinite(audio.duration)?audio.duration:Infinity;
+  target=Math.max(0,Math.min(target,Math.max(0,duration-0.25)));
+  try{
+    audio.currentTime=target;
+    localStorage.setItem(keyPos(),String(target));
+    lastKnownGoodTime=target;
+    lastProgressTime=target;
+    lastProgressTimestamp=Date.now();
+    updateUI();
+  }catch(e){setRecoveryStatus("Springen derzeit nicht möglich");}
+}
+let pendingSeek=null;
+function requestSeek(target){
+  pendingSeek=target;
+  clearTimeout(seekTimer);
+  seekTimer=setTimeout(()=>{
+    const pos=pendingSeek;
+    pendingSeek=null;
+    seekTo(pos);
+  },140);
 }
 function getResumePosition(){
   const stored = Number(localStorage.getItem(keyPos()) || 0);
@@ -262,45 +267,8 @@ function getResumePosition(){
   return Math.max(stored, lastKnownGoodTime, current);
 }
 function recoverPlayback(reason="Unterbrechung"){
-  if(recoveryInProgress || !tracks[trackIndex] || userPaused || !shouldBePlaying) return;
-
-  recoveryInProgress = true;
-  recoveryAttempts++;
-  const resumeAt = getResumePosition();
-  const delay = Math.min(800 * recoveryAttempts, 4000);
-  setRecoveryStatus(`${reason} – verbinde neu …`);
-
-  clearTimeout(recoveryTimer);
-  recoveryTimer = setTimeout(() => {
-    const originalUrl = tracks[trackIndex].url;
-    const retryUrl = originalUrl + (originalUrl.includes("?") ? "&" : "?") + "_retry=" + Date.now();
-
-    try { audio.pause(); } catch(e) {}
-    audio.removeAttribute("src");
-    audio.load();
-    audio.src = retryUrl;
-    audio.load();
-
-    const resume = async () => {
-      try {
-        if(resumeAt > 0){
-          await seekReliably(resumeAt);
-        }
-        await audio.play();
-        recoveryInProgress = false;
-        recoveryAttempts = 0;
-        lastProgressTimestamp = Date.now();
-        setRecoveryStatus(`Weiter ab ${fmt(resumeAt)}`);
-        setTimeout(()=>{ if(!recoveryInProgress) setRecoveryStatus(""); }, 2500);
-      } catch(e) {
-        recoveryInProgress = false;
-        setRecoveryStatus("Neuer Verbindungsversuch …");
-        setTimeout(()=>recoverPlayback("Verbindung unterbrochen"), 1000);
-      }
-    };
-
-    audio.addEventListener("canplay", resume, {once:true});
-  }, delay);
+  // Kein automatisches Neustarten nach Stoppen/Fehlern.
+  setRecoveryStatus(reason+" – zum Fortsetzen ▶ drücken");
 }
 function updateUI(){
   $("play").textContent=audio.paused?"▶":"⏸";
@@ -316,14 +284,11 @@ function updateMediaSession(){
   });
 }
 
-audio.addEventListener("loadedmetadata",async()=>{
+audio.addEventListener("loadedmetadata",()=>{
   if(restoring){
     const p=Number(localStorage.getItem(keyPos())||0);
-    if(p>0){
-      setRecoveryStatus(`Springe zu ${fmt(p)} …`);
-      const ok=await seekReliably(p);
-      setRecoveryStatus(ok ? `Fortgesetzt bei ${fmt(p)}` : `Position ${fmt(p)} konnte nicht gesetzt werden`);
-      setTimeout(()=>{if(!recoveryInProgress)setRecoveryStatus("");},2200);
+    if(p>0 && (!Number.isFinite(audio.duration)||p<audio.duration-1)){
+      seekTo(p);
     }
     restoring=false;
   }
@@ -348,47 +313,21 @@ audio.addEventListener("play",()=>{
   updateUI();
 });
 audio.addEventListener("pause",()=>{
-  savePosition();
-  updateUI();
-  renderChapters();
-  if(!userPaused && shouldBePlaying && !audio.ended && !recoveryInProgress){
-    setTimeout(()=>{
-      if(audio.paused && !userPaused && shouldBePlaying && !audio.ended){
-        recoverPlayback("Wiedergabe gestoppt");
-      }
-    },1200);
-  }
+  savePosition();updateUI();renderChapters();
 });
-audio.addEventListener("stalled",()=>{
-  if(shouldBePlaying && !userPaused) recoverPlayback("Stream hängt");
-});
-audio.addEventListener("error",()=>{
-  if(shouldBePlaying && !userPaused){
-    recoveryInProgress=false;
-    recoverPlayback("Streamfehler");
-  }
-});
-audio.addEventListener("waiting",()=>{
-  if(shouldBePlaying && !userPaused) setRecoveryStatus("Pufferung …");
-});
-audio.addEventListener("playing",()=>{
-  if(!recoveryInProgress) setRecoveryStatus("");
-});
-
-setInterval(()=>{
-  if(audio.paused || audio.ended || recoveryInProgress || userPaused || !shouldBePlaying || !audio.src) return;
-  if(Date.now()-lastProgressTimestamp > 8000){
-    recoverPlayback("Keine Audiodaten");
-  }
-},3000);
-
+audio.addEventListener("stalled",()=>setRecoveryStatus("Stream unterbrochen – ▶ zum Fortsetzen"));
+audio.addEventListener("error",()=>setRecoveryStatus("Audiofehler – Kapitel erneut wählen"));
+audio.addEventListener("playing",()=>setRecoveryStatus(""));
 audio.addEventListener("ended",()=>{
+  shouldBePlaying=false;
+  userPaused=true;
   localStorage.setItem(keyDone(trackIndex),"1");
   localStorage.setItem(keyPos(),"0");
-  if(trackIndex<tracks.length-1) loadTrack(trackIndex+1,true,false);
-  else { updateUI(); renderChapters(); }
+  lastKnownGoodTime=0;
+  updateUI();
+  renderChapters();
+  setRecoveryStatus("Kapitel beendet – ▶ spielt es erneut ab");
 });
-
 $("play").onclick=()=>{
   if(!audio.src){
     userPaused=false;
@@ -399,7 +338,10 @@ $("play").onclick=()=>{
   if(audio.paused){
     userPaused=false;
     shouldBePlaying=true;
-    audio.play();
+    if(audio.ended || (Number.isFinite(audio.duration) && audio.currentTime >= audio.duration-0.5)){
+      seekTo(0);
+    }
+    audio.play().catch(()=>setRecoveryStatus("Wiedergabe fehlgeschlagen – Kapitel erneut wählen"));
   }else{
     userPaused=true;
     shouldBePlaying=false;
@@ -407,23 +349,26 @@ $("play").onclick=()=>{
     audio.pause();
   }
 };
-$("back").onclick=async()=>{const t=Math.max(0,audio.currentTime-15);await seekReliably(t);savePosition();};
-$("forward").onclick=async()=>{const t=Math.min(audio.duration||Infinity,audio.currentTime+15);await seekReliably(t);savePosition();};
+$("back").onclick=()=>requestSeek((pendingSeek ?? audio.currentTime)-15);
+$("forward").onclick=()=>requestSeek((pendingSeek ?? audio.currentTime)+15);
 $("prev").onclick=()=>{ if(trackIndex>0)loadTrack(trackIndex-1,true,true); };
 $("next").onclick=()=>{ if(trackIndex<tracks.length-1)loadTrack(trackIndex+1,true,true); };
-$("seek").onchange=async e=>{
-  if(!audio.duration)return;
-  const target=(Number(e.target.value)/1000)*audio.duration;
-  setRecoveryStatus(`Springe zu ${fmt(target)} …`);
-  await seekReliably(target);
-  savePosition();
+$("seek").onchange=e=>{
+  if(!Number.isFinite(audio.duration))return;
+  requestSeek((Number(e.target.value)/1000)*audio.duration);
+};
+$("restart").onclick=()=>{
+  localStorage.setItem(keyPos(),"0");
+  lastKnownGoodTime=0;
+  seekTo(0);
   setRecoveryStatus("");
 };
-$("restart").onclick=()=>{audio.currentTime=0;savePosition();};
 $("forget").onclick=()=>{
   localStorage.removeItem(keyPos());
   localStorage.removeItem(keyDone(trackIndex));
-  audio.currentTime=0; renderChapters();
+  lastKnownGoodTime=0;
+  seekTo(0);
+  renderChapters();
 };
 const speeds=[1,1.15,1.25,1.5,1.75,2];
 $("speed").onclick=()=>{
@@ -442,15 +387,22 @@ document.addEventListener("visibilitychange",()=>{if(document.hidden)savePositio
 if("mediaSession" in navigator){
   try{
     navigator.mediaSession.setActionHandler("play",()=>audio.play());
-    navigator.mediaSession.setActionHandler("pause",()=>audio.pause());
-    navigator.mediaSession.setActionHandler("seekbackward",d=>audio.currentTime=Math.max(0,audio.currentTime-(d.seekOffset||15)));
-    navigator.mediaSession.setActionHandler("seekforward",d=>audio.currentTime=Math.min(audio.duration||Infinity,audio.currentTime+(d.seekOffset||15)));
+    navigator.mediaSession.setActionHandler("pause",()=>{userPaused=true;shouldBePlaying=false;audio.pause();});
+    navigator.mediaSession.setActionHandler("seekbackward",d=>requestSeek((pendingSeek ?? audio.currentTime)-(d.seekOffset||15)));
+    navigator.mediaSession.setActionHandler("seekforward",d=>requestSeek((pendingSeek ?? audio.currentTime)+(d.seekOffset||15)));
     navigator.mediaSession.setActionHandler("previoustrack",()=>{if(trackIndex>0)loadTrack(trackIndex-1,true,true);});
     navigator.mediaSession.setActionHandler("nexttrack",()=>{if(trackIndex<tracks.length-1)loadTrack(trackIndex+1,true,true);});
-    navigator.mediaSession.setActionHandler("seekto",d=>{if(d.seekTime!=null)audio.currentTime=d.seekTime;});
+    navigator.mediaSession.setActionHandler("seekto",d=>{if(d.seekTime!=null)requestSeek(d.seekTime);});
   }catch(e){}
 }
 
+const playerElement=document.querySelector(".player");
+function adjustPlayerSpace(){
+  document.body.style.setProperty("--player-space",(Math.ceil(playerElement.getBoundingClientRect().height)+24)+"px");
+}
+new ResizeObserver(adjustPlayerSpace).observe(playerElement);
+window.addEventListener("resize",adjustPlayerSpace);
+adjustPlayerSpace();
 loadBook(bookId,true);
 </script>
 </body>
